@@ -1,0 +1,107 @@
+# Rutas relativas a este archivo. Copiá acá el contenido de Drive:
+#   MyDrive/DRON/viscon-rgb-orthophoto-recortado.tif     -> data/orthos/
+#   MyDrive/weed_detection/orthomosaico/*.tif            -> data/orthos/
+#   MyDrive/weed_detection/tiles/  (jpg + tiles_metadata*.json) -> data/tiles/
+#   MyDrive/weed_detection/labels/                       -> data/labels/
+#   MyDrive/weed_detection/runs/                         -> runs/   (para reusar best.pt)
+
+paths:
+  tiles_dir: data/tiles
+  labels_dir: data/labels
+  dataset_dir: data/dataset
+  runs_dir: runs
+  outputs_dir: outputs
+
+# prefix "" = nomenclatura del ortomosaico original (tile_00000.jpg + tiles_metadata.json)
+# prefix "o2" = tile_o2_00000.jpg + tiles_metadata_o2.json, etc.
+orthos:
+  - {path: data/orthos/viscon-rgb-orthophoto-recortado.tif, prefix: ""}
+  - {path: data/orthos/ortomosaico_2.tif, prefix: o2}
+  - {path: data/orthos/ortomosaico_3.tif, prefix: o3}
+  - {path: data/orthos/ortomosaico_4.tif, prefix: o4}
+
+tiling:
+  tile_size: 1024
+  overlap: 200            # px de solape entre tiles vecinos
+  nodata_threshold: 0.3   # tiles con más de este % de píxeles negros se descartan
+
+split:
+  val_ratio: 0.15
+  seed: 42
+  # split espacial: tiles agrupados en bloques de NxN; cada bloque va entero a train o a val.
+  # Evita que tiles solapados (casi la misma imagen) queden uno en train y otro en val.
+  block_tiles: 3
+
+augment:
+  enabled: true
+  n_synthetic: 150
+  area_percentile: 85     # boxes por encima de este percentil de área = "manchón grande"
+  min_cluster_boxes: 5    # tiles con esta cantidad de boxes o más = "fila densa"
+  min_donors_per_tile: 1
+  max_donors_per_tile: 3
+  max_placement_attempts: 15
+  max_donor_draws_multiplier: 4
+  seed: 42
+
+train:
+  model: yolov8n.pt
+  device: auto            # auto | cpu | 0 (cuda)
+  params:
+    epochs: 150
+    patience: 30
+    imgsz: 1024
+    batch: 8
+    degrees: 15
+    flipud: 0.5
+    fliplr: 0.5
+    hsv_h: 0.015
+    hsv_s: 0.5
+    hsv_v: 0.3
+    mosaic: 1.0
+    dropout: 0.1
+
+predict:
+  weights: runs/v4/weights/best.pt
+  device: auto            # auto | cpu | 0 | intel:gpu (solo con modelo exportado a OpenVINO)
+  conf: 0.1               # calibrado (maleza calibrar, 2026-11-03): más recall sin más manchas falsas
+  batch: 8
+  train_resolution_m: 0.05  # resolución de los ortos de entrenamiento; la app avisa si difiere mucho
+  review_conf_min: 0.1      # la app detecta con este umbral y filtra después (para ver las dudosas)
+  nodata_threshold: 0.9   # en inferencia se descartan solo tiles casi vacíos (bordes)
+  # dedup entre tiles solapados (reemplaza al DBSCAN): se descarta una caja si tiene
+  # IoU > dedup_iou con otra de mayor confianza, o si está cortada por el borde del tile y
+  # la intersección cubre > dedup_ios de la caja más chica (la planta completa en el tile vecino)
+  dedup_iou: 0.5
+  dedup_ios: 0.6
+
+prescripcion:
+  buffer_pos_m: 2.0   # buffer positivo de los polígonos de maleza antes de disolver
+  buffer_neg_m: 1.0   # buffer negativo después de disolver (igual al positivo = solo cierra huecos)
+  rx_maleza: 100.0    # dosis de las zonas con maleza
+  rx_fondo: 0.0       # dosis del resto del lote (si se agrega el fondo)
+  unidad: L/ha        # L/ha o kg/ha
+  celda_m: 1.0        # tamaño de celda de la grilla de ISOXML y del TIFF de DJI
+
+polygonize:
+  margin_min_m: 0.15
+  margin_ratio: 0.35      # margen = 35% de la diagonal del box, con piso de margin_min_m
+  grabcut_iter: 5
+  min_blob_area_px: 15
+  max_grabcut_px: 256     # recortes más grandes se procesan reducidos (GrabCut es lento en recortes grandes)
+  exg_threshold: 0.05     # respaldo si GrabCut falla: píxeles con ExG > umbral dentro de la caja
+  # contorno por manchón verde (completa manchones que el modelo detecta en partes)
+  green_resolution_m: 0     # resolución de la máscara de verde (0 = la original del orto; 0.1 = promediar a 10 cm,
+                            # más rápido pero las plantas chicas o pálidas se mezclan con el suelo y se pierden)
+  green_speck_m2: 0.04      # grupos de píxeles verdes más chicos se borran antes del cierre (rastrojo suelto)
+  green_peak_window_m: 0.1  # el verde pico se mide promediado a esta escala (un píxel suelto no define el pico)
+  green_close_m: 0.3        # une plantas separadas por menos que esto en un mismo manchón
+  green_min_area_m2: 0.1    # manchas más chicas se ignoran (ruido)
+  green_orphan_min_m2: 0.25 # manchas sin detección que se agregan (si se activa la opción)
+  border_exclude_m: 0.0     # recorta los polígonos a esta distancia del borde del orto (alambrado, banquina,
+                            # cultivo vecino: verde real que no es maleza del lote). 0 = sin recorte
+  green_max_expand_m: 0.0   # el polígono no se extiende más que esto fuera de sus cajas (0 = sin límite)
+  # verde pico = máximo de 2G-R-B (escala 0-255) de la mancha. Absoluto y no ExG normalizado: en sombras del
+  # rastrojo el normalizado da falsos verdes (revisión manual 2026-11-03).
+  green_min_peak: 25         # manchas tocadas por el modelo con menos verde pico se descartan (calibrado)
+  green_orphan_min_peak: 40  # ídem manchas sin detección (calibrado: ninguna mancha revisada como «no» pasa)
+  # valores calibrados con `maleza calibrar` + revisión manual de 192 manchas (2026-11-03)

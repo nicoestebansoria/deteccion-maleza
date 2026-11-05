@@ -1,0 +1,5 @@
+[server]
+maxUploadSize = 4000  # MB, para ortomosaicos grandes
+
+[browser]
+gatherUsageStats = false

@@ -1,0 +1,33 @@
+[project]
+name = "deteccion-maleza"
+version = "0.1.0"
+description = "Detección automática de malezas en ortomosaicos RGB de dron (YOLO + GrabCut)"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "ultralytics>=8.3",
+    "rasterio>=1.3",
+    "geopandas>=0.14",
+    "shapely>=2.0",
+    "opencv-python>=4.8",
+    "numpy",
+    "pillow",
+    "pyyaml",
+    "folium",
+    "pyside6>=6.7",
+]
+
+[project.optional-dependencies]
+# etiquetado en Jupyter local (mismo widget que en Colab)
+label = ["jupyterlab", "ipywidgets", "jupyter_bbox_widget"]
+# inferencia acelerada en CPU/GPU Intel (Arc) vía OpenVINO
+openvino = ["openvino>=2024.0"]
+
+[project.scripts]
+maleza = "maleza.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/maleza"]

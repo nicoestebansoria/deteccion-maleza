@@ -1,0 +1,15 @@
+data/
+outputs/
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+*_openvino_model/
+*.zip
+*.pt
+# de las corridas solo se versiona el modelo predeterminado de config.yaml
+runs/*
+!runs/v4/
+runs/v4/*
+!runs/v4/weights/
+runs/v4/weights/*
+!runs/v4/weights/best.pt
