@@ -45,13 +45,13 @@ El mapa usa Leaflet y el satélite de Esri, así que necesita internet para el f
    resolución difiere mucho de la de entrenamiento (5 cm/px). Si el CRS está en grados, reproyecta sola una
    copia a su zona UTM en `outputs/<orto>/<orto>_UTM.tif` y trabaja con ella; el original no se toca.
    - **Perímetro del lote** (opcional): **Cargar perímetro…** acepta SHP, GPKG, GeoJSON o KML, en
-     cualquier CRS, sueltos o dentro de un ZIP con una sola capa. La app recorta el ortomosaico al lote y lo guarda en
-     `outputs/<orto>/recortes/<orto>__<lote>.tif`; si ya existe y está al día, lo reutiliza.
-     La detección, el verde y el mapa usan ese recorte. Las cajas y los polígonos finales se recortan
-     exactamente al perímetro, que se dibuja en celeste. **Quitar** vuelve al orto completo.
-   - **Capa con varios lotes:** cada elemento del archivo es un lote. Aparece un desplegable con todos (el
-     nombre sale de la columna `Lote`, `Nombre` o `Name`) y al elegir uno se recorta el orto a ese lote. El mapa
-     muestra todos con su nombre y el elegido en celeste. Cambiar de lote descarta la detección anterior.
+     cualquier CRS, sueltos o dentro de un ZIP con una sola capa. Cada elemento del archivo es un lote: si hay varios,
+     aparece un desplegable (el nombre sale de la columna `Lote`, `Nombre` o `Name`) y queda elegido solo el lote
+     que cubre el ortomosaico. Se puede cambiar a mano; el mapa muestra todos con su nombre y el elegido en celeste.
+   - **Recortar** aplica el recorte: nada se recorta hasta tocarlo. El orto recortado queda en
+     `outputs/<orto>/recortes/<orto>__<lote>.tif` y, si ya existe y está al día, se reutiliza. La detección, el verde
+     y el mapa usan ese recorte, y las cajas y los polígonos finales se recortan exactamente al perímetro. Aplicar
+     otro recorte descarta la detección anterior. **Quitar** vuelve al orto completo.
 2. **Detección:** corre el modelo con un umbral bajo (`review_conf_min`), así después se puede
    filtrar por confianza sin volver a detectar.
 3. **Resultado:** el mapa muestra directamente los polígonos, que combinan el modelo con el índice
@@ -65,19 +65,29 @@ El mapa usa Leaflet y el satélite de Esri, así que necesita internet para el f
      llega a `green_min_peak_exg` (rastrojo o suelo apenas verdoso) y las detecciones del modelo
      sin verde.
    - Todo se ajusta en la sección **Ajustes** y se aplica con **Aplicar ajustes** (el mapa conserva el zoom).
-   - **Exportar** guarda polígonos + cajas en GPKG/GeoJSON/SHP en la carpeta que elijas
-     (por defecto `outputs/<orto>/`).
 4. **Prescripción:** une los polígonos de maleza en zonas de aplicación y asigna las dosis.
    - **Buffer positivo / negativo:** buffer +X, disolver y buffer −Y.
    - **Fondo** (opcional): agrega el resto del lote como otra zona, con su propia dosis. El lote es el
-     perímetro cargado o, si no hay, el área con datos del orto.
+     perímetro cargado o, si no hay, el área con datos del orto. Sin marcarlo, el archivo lleva solo la zona de
+     maleza. El perfil Case IH Pro 700 / NH IntelliView III-IV se carga como límite y nunca lleva fondo.
    - **Dosis:** la tabla tiene la columna `rx` para "Con maleza" y "Fondo", en L/ha o kg/ha.
      **Generar prescripción** la muestra en el mapa (violeta = maleza, verde = fondo), con las ha y el
      producto total.
-   - **Exportar prescripción** (por defecto `outputs/<orto>/prescripcion/`):
-     - **Shapefile** en WGS84, una fila por zona (maleza y fondo), con los campos `zona`, `rx`, `unidad` y `ha`, más un `.zip` para
-       Operations Center. Sirve para John Deere, Trimble, Raven, Ag Leader y monitores genéricos.
-     - **ISOXML** (`TASKDATA/TASKDATA.XML` + grilla tipo 1): para terminales ISOBUS.
+   - **Monitor:** el desplegable define el formato, la carpeta del pendrive y cómo se arman las zonas. Debajo se
+     muestra lo que aplica y lo que hay que configurar en el monitor. Cambiar de monitor regenera la prescripción.
+     Los que necesitan un conversor o no tienen documentación aparecen deshabilitados. Detalle y fuentes en
+     [docs/prescripciones_monitores.md](docs/prescripciones_monitores.md). **Ningún perfil se probó todavía en un
+     monitor real: probar con agua y un archivo chico.**
+   - **Grilla cuadrada** (casilla, apagada por defecto): pasa la maleza a bloques alineados al norte, del tamaño de
+     celda elegido. Toda celda que toca maleza se aplica entera, así que aumenta la superficie aplicada.
+   - **Manchón mínimo** (casilla, apagada por defecto): ancho de sección × velocidad × retardo. Los manchones más
+     chicos se agrandan hasta esa superficie.
+   - **Exportar prescripción** propone como nombre el del lote (o el del orto, sin recorte) y deja cambiarlo; los
+     caracteres raros se reemplazan, porque algunos monitores no los leen. Crea `<nombre>_<monitor>/`, con la
+     estructura lista para copiar a la raíz del pendrive, y el mismo contenido en un `.zip` (por defecto en
+     `outputs/<orto>/prescripcion/`):
+     - **Shapefile** en WGS84, una fila por polígono, con `RATE` como único campo.
+     - **ISOXML** (`TASKDATA/TASKDATA.XML` + grilla tipo 1).
      - **DJI Agras:** carpeta `DJI/` con el límite (`Shapefile/`) y la dosis en GeoTIFF (`Rx/`).
    - La grilla de ISOXML y del TIFF usa celdas de `prescripcion.celda_m` (1 m). Una celda que toca
      maleza se aplica completa, así que el área aplicada sale algo mayor que la de las zonas.
@@ -104,7 +114,7 @@ uv run maleza predict --tif D:/vuelos/nuevo.tif
 uv run maleza inspect data/tiles/tile_00003.jpg    # confianzas crudas (diagnóstico)
 ```
 
-Los resultados quedan en `outputs/<ortomosaico>/`: detecciones (cajas) y polígonos en GPKG,
+Los resultados de `maleza predict` quedan en `outputs/<ortomosaico>/`: detecciones (cajas) y polígonos en GPKG,
 y también GeoJSON y SHP.
 
 ## Cambios respecto al notebook

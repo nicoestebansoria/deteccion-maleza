@@ -18,7 +18,7 @@ Ver [README.md](README.md) para instalación y uso.
   `uv run --no-sync` o el python del venv.
 - `src/maleza/__init__.py` borra PROJ_LIB/GDAL_DATA de MapWinGIS (rompían rasterio).
   Si un script no importa `maleza` primero, aparecen errores de DLL de MapWinGIS.
-- Repo privado: https://github.com/nicoestebansoria/deteccion-maleza. Ramas: `dev` (donde se hacen las mejoras),
+- Repo público: https://github.com/nicoestebansoria/deteccion-maleza. Ramas: `dev` (donde se hacen las mejoras),
   `prod` (versión definitiva) y `main` (backup). De las corridas solo se versiona `runs/v4/weights/best.pt`; `data/`,
   `outputs/` y los zips quedan fuera del repo.
 
@@ -74,8 +74,8 @@ QWebEngineView a la derecha. Los cálculos largos (vista previa, detección, pol
      polígonos. Una pantalla en zoom 21 carga en ~0.5 s.
    - El mapa folium muestra los polígonos (las cajas se prenden con un checkbox o el selector de capas). El orto se reproyecta
      a EPSG:3857 con WarpedVRT; sin eso quedaba corrido hasta 12 m.
-   - **Exportar:** escribe GPKG, GeoJSON y SHP en la carpeta elegida (por defecto `outputs/<orto>/`).
-     Columnas: confidence, area_m2, source, metodo, n_det, exg_medio, exg_pico.
+   - El botón de exportar polígonos (GPKG/GeoJSON/SHP) se sacó de la app a pedido del usuario (2026-11-08);
+     la salida es la prescripción. `polygonize.export` sigue para el CLI (`maleza predict`).
    - Resultado típico en el orto de prueba (conf 0.35): unos 2020 polígonos y unos 6220 m²
      (a 10 cm eran 1470 y 5050 m²).
 4. **Pestaña Entrenamiento:** ver el pool de entrenamiento y el estado de las corridas, y
@@ -134,18 +134,25 @@ manchones gigantes). Tabla en `outputs/<orto>/calibracion.csv`; detecciones crud
 - `src/maleza/lote.py`: reproyección a UTM de los ortos en grados (`reproject_to_utm`; en la app, `self.utm` y
   `prepare_ortho`, y `base_ortho()` devuelve la copia) y perímetro del lote (`read_lots`, `lot_perimeter`, `clip_ortho` por franjas
   de 1024 filas a GeoTIFF RGBA con deflate, `clip_to_perimeter`). En la app, `ortho()` devuelve el orto recortado si
-  hay perímetro (None mientras se recorta) y `base_ortho()` el elegido en la lista. Si la capa tiene más de un lote
-  (`self.lots`), se elige uno en un desplegable y se recorta al elegirlo (`self.perim`). Un lote = un elemento del
-  archivo. Si el lote no tiene datos en el orto, `clip_ortho` lo rechaza y la app avisa y vuelve al orto completo.
-- `src/maleza/prescripcion.py`: zonas de prescripción (`build_prescription`) y exports.
-  - Shapefile en WGS84 con `rx`.
+  hay recorte aplicado (None mientras se recorta) y `base_ortho()` el elegido en la lista. `self.lots` es la capa
+  cargada; `best_lot` preselecciona en el desplegable el lote que cubre el orto, y el recorte se aplica recién con el
+  botón **Recortar** (`self.perim`). Un lote = un elemento del archivo. Si el lote no tiene datos en el orto,
+  `clip_ortho` lo rechaza y la app avisa y vuelve al orto completo.
+- `src/maleza/prescripcion.py`: zonas de prescripción (`build_prescription`), perfiles por monitor (`PROFILES`,
+  desplegable en la app), adaptación de las zonas al generar (`adapt_to_monitor`) y export (`export_for_monitor`:
+  `<lote>_<monitor>/` con la estructura del pendrive + `.zip`).
+  - Shapefile en WGS84 (.prj de ESRI), una fila por polígono, con `RATE` (N 10.2) como único campo. El fondo va
+    solo si se marca la casilla. Excepción: Pro 700 / IntelliView III-IV (`as_boundary`) copia el archivo de Avansys
+    que funciona cargado como límite: solo maleza, un registro multiparte con huecos, `rx` N 5.4 = 0.
   - ISOXML v3.3 con grilla tipo 1: TZN 0 = fuera del lote, 1 = fondo, 2 = maleza. DDI 1 (L/ha, ×100
     mm³/m²) o DDI 6 (kg/ha, ×100 mg/m²). La primera celda del BIN es la esquina sudoeste.
   - DJI: carpeta `DJI/Shapefile` (límite) + `DJI/Rx` (GeoTIFF de dosis), copiando lo que exporta
     Pix4Dfields.
-  - **Ninguno de los tres se probó todavía en un monitor ni en un dron real.** Probar con un archivo
+  - **Ningún perfil se probó todavía en un monitor ni en un dron real.** Probar con un archivo
     chico antes de usarlo en campo.
   - Config en `prescripcion:` de `config.yaml`.
+  - **Formatos por monitor (carpetas de pendrive, límites, dosis 0, requisitos pendientes):** ver
+    [docs/prescripciones_monitores.md](docs/prescripciones_monitores.md) (relevamiento 2026-11-06).
 - `src/maleza/mapa.py`: vista previa del orto, `build_map` (folium) y listados de ortos/pesos.
 - `src/maleza/polygonize.py`: `green_components`, `polygonize_green`, `polygonize` (GrabCut, que ya
   no se usa en la app) y `export`.

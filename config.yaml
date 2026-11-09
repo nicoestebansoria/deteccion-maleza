@@ -81,6 +81,11 @@ prescripcion:
   rx_fondo: 0.0       # dosis del resto del lote (si se agrega el fondo)
   unidad: L/ha        # L/ha o kg/ha
   celda_m: 1.0        # tamaño de celda de la grilla de ISOXML y del TIFF de DJI
+  grilla_m: 5.0          # tamaño de celda de la grilla cuadrada opcional de las zonas
+  monitor: shp_generico  # monitor elegido al abrir la app (claves en prescripcion.PROFILES)
+  ancho_seccion_m: 0.0   # manchón mínimo = ancho de sección x distancia recorrida durante el retardo; 0 = no agrandar
+  velocidad_kmh: 20.0
+  retardo_s: 2.0
 
 polygonize:
   margin_min_m: 0.15

@@ -67,11 +67,10 @@ def available_weights(cfg):
 
 
 def build_map(preview_url, bounds, boxes=None, polys=None, view=None, boxes_visible=False, tiles=None,
-              tiles_min_zoom=18, perimeter=None, rx=None, lots=None):
+              tiles_min_zoom=18, rx=None, lots=None):
     """preview_url: URL (o data URI) de la imagen de ortho_preview; bounds: (w, s, e, n) en WGS84.
     view: (lat, lon, zoom) para conservar el encuadre al redibujar; sin view se encuadra el orto.
     tiles: (url XYZ, zoom nativo) de tiles.TileServer: desde tiles_min_zoom el orto se ve a resolución completa.
-    perimeter: GeoDataFrame del perímetro del lote (se dibuja solo el contorno).
     rx: GeoDataFrame de prescripción.build_prescription (zonas maleza / fondo).
     lots: GeoDataFrame de lotes para elegir (columnas nombre, elegido): contorno con su nombre, celeste si está elegido."""
     w, s, e, n = bounds
@@ -110,10 +109,6 @@ def build_map(preview_url, bounds, boxes=None, polys=None, view=None, boxes_visi
             tooltip=folium.GeoJsonTooltip(["zona", "rx", "unidad", "ha"], aliases=["Zona", "rx", "Unidad", "ha"],
                                           localize=True),
         ).add_to(m)
-    if perimeter is not None:
-        folium.GeoJson(perimeter[["nombre", "geometry"]].to_crs("EPSG:4326"), name="Perímetro del lote",
-                       style_function=lambda f: {"color": "#00e5ff", "weight": 2.5, "fill": False},
-                       interactive=False).add_to(m)
     if polys is not None and len(polys):
         folium.GeoJson(
             polys.to_crs("EPSG:4326"), name="Malezas (polígonos)",

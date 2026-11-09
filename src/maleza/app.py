@@ -26,12 +26,13 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                                QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
 from maleza import review as rv
-from maleza.lote import (PERIMETER_FILTER, clip_ortho, clip_to_perimeter, clipped_path, is_fresh, lot_perimeter,
-                         perimeter_in, read_lots, reproject_to_utm, utm_path)
+from maleza.lote import (PERIMETER_FILTER, best_lot, clip_ortho, clip_to_perimeter, clipped_path, is_fresh,
+                         lot_perimeter, perimeter_in, read_lots, reproject_to_utm, utm_path)
 from maleza.mapa import available_weights, build_map, list_orthos, ortho_info, ortho_preview
-from maleza.polygonize import clip_border, export, green_components, ortho_footprint, polygonize_green
+from maleza.polygonize import clip_border, green_components, ortho_footprint, polygonize_green
 from maleza.predict import detect_ortho, load_model
-from maleza.prescripcion import FORMATS, UNITS, build_prescription, export_prescription, safe_name, summary
+from maleza.prescripcion import (DEFAULT_MONITOR, PROFILES, UNITS, adapt_to_monitor, build_prescription,
+                                 export_for_monitor, min_patch_m2, n_polygons, over_limit, safe_name, summary)
 from maleza.tiles import TileServer
 from maleza.train import launch_training, run_status
 
@@ -67,6 +68,13 @@ class Task(QObject):
             self.failed.emit(traceback.format_exc())
 
 
+class NoWheelSlider(QSlider):
+    """La rueda del mouse no cambia el valor: pasa al panel, que sigue scrolleando."""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 class FloatSlider(QWidget):
     valueChanged = Signal(float)
 
@@ -74,7 +82,7 @@ class FloatSlider(QWidget):
         super().__init__()
         self.lo, self.step = lo, step
         self.decimals = max(0, -math.floor(math.log10(step)))
-        self.slider = QSlider(Qt.Horizontal)
+        self.slider = NoWheelSlider(Qt.Horizontal)
         self.slider.setRange(0, round((hi - lo) / step))
         self.slider.setValue(round((min(max(value, lo), hi) - lo) / step))
         self.val = QLabel()
@@ -244,13 +252,18 @@ class MainWindow(QMainWindow):
         self.info = None
         self.utm = {}                      # orto elegido -> con cuál se trabaja: él mismo, o su copia en UTM si venía
         #                                    en grados (None mientras se reproyecta)
-        self.perim = None                  # {"path", "gdf", "recorte"} perímetro con el que se recorta
-        self.lots = None                   # {"path", "gdf"} capa con más de un lote, para elegir uno
+        self.perim = None                  # {"path", "gdf", "recorte", "i"} lote al que ya se recortó
+        self.lots = None                   # {"path", "gdf"} capa cargada
+        self.lot_auto = None               # (orto, capa) para los que ya se buscó el lote
+        self.lot_auto_job = 0              # la última búsqueda vale solo si nadie cambió la elección después
         self.clips = {}                    # (orto, recorte) -> orto recortado al lote
         self.clipping = None               # (orto, perímetro) que se está recortando
         self.det = None                    # {"ortho", "weights", "raw", "n_raw"}
         self.final = self.polys = None
         self.rx = self.rx_boundary = None  # prescripción generada y límite del lote que usó
+        self.rx_job = 0  # la última prescripción pedida: las anteriores se descartan al terminar
+        self.rx_base = None  # (polígonos, ajustes, zonas sin adaptar a un monitor)
+        self.rx_base_lock = threading.Lock()
         self.poly_busy = self.poly_pending = False
         self.map_name, self.map_n = None, 0
 
@@ -324,8 +337,8 @@ class MainWindow(QMainWindow):
         bl.addWidget(label("<b>Perímetro del lote</b>"))
         row = QHBoxLayout()
         self.perim_btn = QPushButton("Cargar perímetro…")
-        self.perim_btn.setToolTip("ZIP, SHP, GPKG, GeoJSON o KML con el contorno del lote. Se recorta el ortomosaico "
-                                  "y los polígonos finales a ese contorno.")
+        self.perim_btn.setToolTip("ZIP, SHP, GPKG, GeoJSON o KML con el contorno del lote. Con Recortar, el ortomosaico "
+                                  "y los polígonos finales se ajustan a ese contorno.")
         self.perim_clear = QPushButton("Quitar")
         self.perim_clear.setEnabled(False)
         row.addWidget(self.perim_btn, 1)
@@ -333,9 +346,12 @@ class MainWindow(QMainWindow):
         bl.addLayout(row)
         self.perim_lbl = label("Sin perímetro: se usa todo el ortomosaico.", "hint")
         bl.addWidget(self.perim_lbl)
-        self.lots_combo = QComboBox()  # solo si la capa tiene más de un lote
+        self.lots_combo = QComboBox()  # visible solo si la capa tiene más de un lote
         self.lots_combo.hide()
         bl.addWidget(self.lots_combo)
+        self.clip_btn = QPushButton("Recortar")
+        self.clip_btn.hide()
+        bl.addWidget(self.clip_btn)
         self.clip_progress = QProgressBar()
         self.clip_progress.hide()
         bl.addWidget(self.clip_progress)
@@ -404,8 +420,9 @@ class MainWindow(QMainWindow):
                                      "Achica las zonas ya unidas. Igual al positivo: solo une y cierra huecos. "
                                      "Menor: deja un margen de seguridad alrededor de la maleza.")
         self.c_bg = QCheckBox("Agregar fondo al resto del lote")
-        self.c_bg.setToolTip("Sin marcar: la prescripción tiene solo las zonas con maleza. Marcado: además, el resto "
-                             "del lote (perímetro cargado o, si no hay, el área del orto) con su propia dosis.")
+        self.c_bg.setToolTip("Marcado: el resto del lote (perímetro cargado o, si no hay, el área del orto) lleva su "
+                             "propia dosis. Sin marcar: el archivo lleva solo la zona de maleza. Los perfiles que se "
+                             "cargan como límite nunca llevan fondo.")
         for w in (self.s_buf_pos, self.s_buf_neg, self.c_bg):
             bl.addWidget(w)
         self.rx_table = QTableWidget(2, 3)
@@ -437,18 +454,43 @@ class MainWindow(QMainWindow):
         self.rx_unit.setCurrentText(rc.get("unidad", "L/ha"))
         row.addWidget(self.rx_unit, 1)
         bl.addLayout(row)
+        bl.addWidget(QLabel("Monitor:"))
+        self.rx_monitor = QComboBox()
+        self.rx_monitor.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        for key, monitor in PROFILES.items():
+            self.rx_monitor.addItem(monitor.label, key)
+            if monitor.format is None:  # se ve en la lista, pero la app no puede generar su archivo
+                item = self.rx_monitor.model().item(self.rx_monitor.count() - 1)
+                item.setEnabled(False)
+                item.setToolTip(monitor.note)
+        self.rx_monitor.setCurrentIndex(self.rx_monitor.findData(rc.get("monitor", DEFAULT_MONITOR)))
+        bl.addWidget(self.rx_monitor)
+        self.rx_monitor_note = label("", "hint")
+        bl.addWidget(self.rx_monitor_note)
+        self.c_grid = QCheckBox("Usar grilla cuadrada")
+        self.c_grid.setToolTip("La maleza se pasa a bloques cuadrados alineados al norte: toda celda que toca maleza "
+                               "se aplica entera, así que aumenta la superficie aplicada.")
+        bl.addWidget(self.c_grid)
+        self.s_grid = FloatSlider("Tamaño de celda (m)", 1.0, 20.0, 1.0, rc.get("grilla_m", 5.0))
+        bl.addWidget(self.s_grid)
+        self.c_machine = QCheckBox("Agrandar manchones chicos según la máquina")
+        self.c_machine.setToolTip("Sin marcar, los manchones quedan como están.")
+        bl.addWidget(self.c_machine)
+        self.s_section = FloatSlider("Ancho de sección (m)", 0.0, 40.0, 0.5, rc.get("ancho_seccion_m", 0.0),
+                                     "Junto con la velocidad y el retardo define el manchón mínimo que la máquina "
+                                     "alcanza a cortar. En 0 no se agranda nada.")
+        self.s_speed = FloatSlider("Velocidad de trabajo (km/h)", 5.0, 40.0, 1.0, rc.get("velocidad_kmh", 20.0))
+        self.s_delay = FloatSlider("Retardo de válvulas (s)", 0.0, 5.0, 0.1, rc.get("retardo_s", 2.0),
+                                   "Tiempo entre la orden de la sección y el cambio real de la aplicación.")
+        for w in (self.s_section, self.s_speed, self.s_delay):
+            bl.addWidget(w)
+        self.rx_patch_note = label("", "hint")
+        bl.addWidget(self.rx_patch_note)
         self.rx_btn = QPushButton("Generar prescripción")
         self.rx_btn.setMinimumHeight(34)
         bl.addWidget(self.rx_btn)
         self.rx_status = label("", "hint")
         bl.addWidget(self.rx_status)
-        bl.addWidget(label("Formatos de exportación:"))
-        self.rx_formats = {}
-        for key, text in FORMATS.items():
-            c = QCheckBox(text)
-            c.setChecked(key == "shp")
-            bl.addWidget(c)
-            self.rx_formats[key] = c
         self.rx_export_btn = QPushButton("Exportar prescripción…")
         self.rx_export_btn.setEnabled(False)
         bl.addWidget(self.rx_export_btn)
@@ -467,8 +509,6 @@ class MainWindow(QMainWindow):
         bl.addWidget(label("Rojo: detectado por el modelo · Naranja: verde sin detección", "hint"))
         self.c_boxes = QCheckBox("Mostrar cajas del modelo en el mapa")
         bl.addWidget(self.c_boxes)
-        self.export_btn = QPushButton("Exportar resultados (GPKG + GeoJSON + SHP)…")
-        bl.addWidget(self.export_btn)
         lay.addWidget(box)
         lay.addStretch(1)
 
@@ -478,6 +518,7 @@ class MainWindow(QMainWindow):
         self.perim_btn.clicked.connect(self.load_perimeter)
         self.perim_clear.clicked.connect(self.clear_perimeter)
         self.lots_combo.currentIndexChanged.connect(self.on_lot_changed)
+        self.clip_btn.clicked.connect(self.apply_clip)
         self.detect_btn.clicked.connect(self.detect)
         for s in (self.s_conf, self.s_exg, self.s_orphan_area, self.s_orphan_peak, self.s_peak, self.s_area,
                   self.s_border):
@@ -488,9 +529,21 @@ class MainWindow(QMainWindow):
         self.c_orphans.toggled.connect(self.s_orphan_area.setEnabled)
         self.c_orphans.toggled.connect(self.s_orphan_peak.setEnabled)
         self.c_boxes.toggled.connect(lambda *_: self.render_map())
-        self.export_btn.clicked.connect(self.export_results)
-        for s in (self.s_buf_pos, self.s_buf_neg):
+        for s in (self.s_buf_pos, self.s_buf_neg, self.s_section, self.s_speed, self.s_delay):
             s.valueChanged.connect(self._rx_changed)
+        for s in (self.s_section, self.s_speed, self.s_delay):
+            s.valueChanged.connect(self._update_patch_note)
+            s.setEnabled(False)
+            self.c_machine.toggled.connect(s.setEnabled)
+        self.s_grid.setEnabled(False)
+        self.s_grid.valueChanged.connect(self._rx_changed)
+        self.c_grid.toggled.connect(self.s_grid.setEnabled)
+        self.c_grid.toggled.connect(self._rx_changed)
+        self.c_machine.toggled.connect(self._update_patch_note)
+        self.c_machine.toggled.connect(self._rx_changed)
+        self.rx_monitor.currentIndexChanged.connect(self._monitor_changed)
+        self._update_monitor_note()
+        self._update_patch_note()
         for spin in self.rx_spins.values():
             spin.valueChanged.connect(self._rx_changed)
         self.c_bg.toggled.connect(self._rx_changed)
@@ -623,7 +676,7 @@ class MainWindow(QMainWindow):
     # ---------- perímetro del lote ----------
 
     def load_perimeter(self):
-        current = self.perim or self.lots
+        current = self.lots
         start = os.path.dirname(current["path"]) if current else os.path.join(self.cfg["root"], "data")
         path, _ = QFileDialog.getOpenFileName(self, "Cargar perímetro del lote", start, PERIMETER_FILTER)
         if not path:
@@ -634,57 +687,109 @@ class MainWindow(QMainWindow):
         except Exception as e:  # archivo sin polígonos, sin CRS, formato no soportado
             QMessageBox.warning(self, "Perímetro del lote", f"No pude leer el perímetro:\n{e}")
             return
-        self.perim = self.lots = None
+        self.perim, self.lots, self.lot_auto = None, {"path": path, "gdf": lots}, None
+        self.lot_auto_job += 1
         self.perim_clear.setEnabled(True)
-        name = os.path.basename(path)
         self.lots_combo.blockSignals(True)
         self.lots_combo.clear()
-        if len(lots) == 1:
-            self._use_lot(path, lots, 0)
-            self.perim_lbl.setText(f"{name} · {lots['ha'].iloc[0]:,.1f} ha")
-        else:
-            self.lots = {"path": path, "gdf": lots}
-            self.perim_lbl.setText(f"{name}: {len(lots)} lotes. Elegí cuál usar.")
-            self.lots_combo.addItem("Todo el ortomosaico (sin recortar)")
-            for nombre, ha in zip(lots["nombre"], lots["ha"]):
-                self.lots_combo.addItem(f"{nombre} · {ha:,.1f} ha")
+        self.lots_combo.addItem("Todo el ortomosaico (sin recortar)")
+        for nombre, ha in zip(lots["nombre"], lots["ha"]):
+            self.lots_combo.addItem(f"{nombre} · {ha:,.1f} ha")
         self.lots_combo.blockSignals(False)
-        self.lots_combo.setVisible(bool(self.lots))
+        self.lots_combo.setVisible(len(lots) > 1)
+        self.clip_btn.show()
+        self.perim_lbl.setText(self._lots_status())
         self.on_selection_changed()
         self.render_map()
 
     def clear_perimeter(self):
-        self.perim = self.lots = None
+        self.perim = self.lots = self.lot_auto = None
+        self.lot_auto_job += 1
         self.perim_lbl.setText("Sin perímetro: se usa todo el ortomosaico.")
         self.perim_clear.setEnabled(False)
         self.lots_combo.hide()
+        self.clip_btn.hide()
         self.on_selection_changed()
         self.render_map()
 
+    def _lots_status(self, detail=""):
+        lots, name = self.lots["gdf"], os.path.basename(self.lots["path"])
+        head = f"{name} · {lots['ha'].iloc[0]:,.1f} ha" if len(lots) == 1 else f"{name}: {len(lots)} lotes"
+        if self.perim:
+            detail = f"Recortado a {self.perim['gdf']['nombre'].iloc[0]}."
+        return f"{head}. {detail}".strip()
+
+    def _set_lot_index(self, index):
+        self.lots_combo.blockSignals(True)
+        self.lots_combo.setCurrentIndex(index)
+        self.lots_combo.blockSignals(False)
+
+    def _detect_lot(self, base):
+        """Preselecciona el lote que cubre el orto, sin recortar: eso queda para el botón."""
+        self.lot_auto = (base, self.lots["path"])
+        self.perim = None
+        self._set_lot_index(0)
+        self.lot_auto_job += 1
+        job_id = self.lot_auto_job
+        lots = self.lots["gdf"]
+        self.perim_lbl.setText(self._lots_status("Buscando el lote del ortomosaico…"))
+
+        def job(_):
+            if base not in self.footprints:
+                self.footprints[base] = ortho_footprint(base)
+            with rasterio.open(base) as src:
+                return best_lot(lots, self.footprints[base], src.crs)
+
+        def done(found):
+            if job_id != self.lot_auto_job:  # el usuario eligió otro o cambió la capa mientras se buscaba
+                return
+            if found is None:
+                self.perim_lbl.setText(self._lots_status("Ningún lote cae dentro del ortomosaico."))
+            else:
+                i, share = found
+                self._set_lot_index(i + 1)
+                which = f"Detectado: {lots['nombre'].iloc[i]}, cubierto" if len(lots) > 1 else "Cubierto"
+                self.perim_lbl.setText(self._lots_status(f"{which} en un {share:.0%}. Tocá Recortar para aplicarlo."))
+            self._update_clip_btn()
+            self.render_map()
+
+        self.run(job, done, on_fail=lambda: self.perim_lbl.setText(self._lots_status()))
+
     def _use_lot(self, path, lots, i):
         gdf = lot_perimeter(path, lots, i)
-        self.perim = {"path": path, "gdf": gdf, "recorte": gdf["recorte"].iloc[0]}
+        self.perim = {"path": path, "gdf": gdf, "recorte": gdf["recorte"].iloc[0], "i": i}
 
     def selected_lot(self):
         """Posición en la capa del lote elegido; -1 con 'Todo el ortomosaico'."""
         return self.lots_combo.currentIndex() - 1
 
     def on_lot_changed(self, *_):
+        self.lot_auto_job += 1
+        self.perim_lbl.setText(self._lots_status())
+        self._update_clip_btn()
+        self.render_map()
+
+    def _update_clip_btn(self):
+        """Recortar se habilita solo si lo elegido difiere de lo que ya está aplicado."""
+        selected, applied = self.selected_lot(), self.perim["i"] if self.perim else -1
+        self.clip_btn.setText("Volver al ortomosaico completo" if selected < 0 and self.perim else "Recortar")
+        self.clip_btn.setEnabled(bool(self.lots and self.base_ortho()) and self.lots_combo.isEnabled()
+                                 and selected != applied)
+
+    def apply_clip(self):
         self.perim = None
         if self.selected_lot() >= 0:
             self._use_lot(self.lots["path"], self.lots["gdf"], self.selected_lot())
+        self.perim_lbl.setText(self._lots_status())
         self.on_selection_changed()
         self.render_map()
 
     def _drop_clip(self):
-        """El recorte no se pudo hacer: vuelve al orto completo; con una capa de varios lotes, se puede elegir otro."""
-        if not self.lots:
-            self.clear_perimeter()
-            return
-        self.lots_combo.blockSignals(True)
-        self.lots_combo.setCurrentIndex(0)
-        self.lots_combo.blockSignals(False)
-        self.on_lot_changed()
+        """El recorte no se pudo hacer: vuelve al orto completo y se puede elegir otro lote."""
+        self.perim = None
+        self.perim_lbl.setText(self._lots_status())
+        self.on_selection_changed()
+        self.render_map()
 
     def start_clip(self, base):
         key = (base, self.perim["recorte"])
@@ -695,6 +800,7 @@ class MainWindow(QMainWindow):
         gdf, perim_path = self.perim["gdf"], self.perim["path"]
         self.perim_btn.setEnabled(False)
         self.lots_combo.setEnabled(False)
+        self.clip_btn.setEnabled(False)
         self.clip_progress.setValue(0)
         self.clip_progress.setFormat("Recortando el ortomosaico al lote… %p%")
         self.clip_progress.show()
@@ -738,8 +844,11 @@ class MainWindow(QMainWindow):
         if selected and selected not in self.utm:
             self.prepare_ortho(selected)
         base = self.base_ortho()
+        if base and self.lots and self.lot_auto != (base, self.lots["path"]):
+            self._detect_lot(base)
         if base and self.perim and (base, self.perim["recorte"]) not in self.clips:
             self.start_clip(base)
+        self._update_clip_btn()
         path = self.ortho()
         if self.det and (self.det["ortho"] != path or self.det["weights"] != self.weights()):
             self.det = self.final = self.polys = None
@@ -806,7 +915,7 @@ class MainWindow(QMainWindow):
     def detect(self):
         path, weights, cfg = self.ortho(), self.weights(), self.cfg
         perim = self.perimeter_geom(path)
-        for w in (self.detect_btn, self.weights_combo, self.ortho_combo, self.lots_combo):
+        for w in (self.detect_btn, self.weights_combo, self.ortho_combo, self.lots_combo, self.clip_btn):
             w.setEnabled(False)
         self.progress.setValue(0)
         self.progress.setFormat("Cargando modelo…")
@@ -933,13 +1042,40 @@ class MainWindow(QMainWindow):
             self.cards[k].setToolTip(f"Calculado con: {origen}.")
         self.status.setText(f"Hectáreas con malezas según: {origen}.\n{n} polígonos de {len(self.final)} "
                             f"detecciones con confianza ≥ {self.applied_conf:.2f} (de {len(self.det['raw'])} crudas)")
-        self.export_btn.setEnabled(bool(n))
 
     # ---------- 4. prescripción ----------
 
     def _rx_changed(self, *_):
         if self.rx is not None:
             self.rx_btn.setText("Generar prescripción (hay cambios)")
+
+    def _update_monitor_note(self):
+        monitor = PROFILES[self.rx_monitor.currentData()]
+        folder = {"shp": monitor.folder + "/" if monitor.folder else "raíz", "isoxml": "TASKDATA/", "dji": "DJI/"}
+        details = [f"Carpeta: {folder[monitor.format]}"]
+        if monitor.max_polys:
+            details.append(f"máximo {monitor.max_polys} polígonos")
+        if monitor.as_boundary:
+            details.append("se carga como límite (solo maleza, un registro)")
+        if not monitor.holes:
+            details.append("maleza sin anillos")
+        self.rx_monitor_note.setText("\n".join(t for t in (" · ".join(details), monitor.note) if t))
+
+    def _update_patch_note(self, *_):
+        area = self._min_patch()
+        self.rx_patch_note.setVisible(self.c_machine.isChecked())
+        self.rx_patch_note.setText(f"Manchón mínimo: {area:,.0f} m². Los más chicos se agrandan hasta esa superficie."
+                                   if area else "Con ancho de sección 0 no se agrandan los manchones chicos.")
+
+    def _min_patch(self):
+        if not self.c_machine.isChecked():
+            return 0.0
+        return min_patch_m2(self.s_section.value(), self.s_speed.value(), self.s_delay.value())
+
+    def _monitor_changed(self, *_):
+        self._update_monitor_note()
+        if self.rx is not None or not self.rx_btn.isEnabled():  # lo exportable tiene que ser siempre de este monitor
+            self.make_prescription()
 
     def clear_prescription(self):
         self.rx = self.rx_boundary = None
@@ -964,25 +1100,42 @@ class MainWindow(QMainWindow):
         args = dict(buf_pos=self.s_buf_pos.value(), buf_neg=self.s_buf_neg.value(),
                     rx_weed=self.rx_spins["maleza"].value(), rx_bg=self.rx_spins["fondo"].value(),
                     background=self.c_bg.isChecked(), unit=self.rx_unit.currentText())
+        key, min_patch = self.rx_monitor.currentData(), self._min_patch()
+        grid_m = self.s_grid.value() if self.c_grid.isChecked() else 0.0
         self.rx_btn.setEnabled(False)
+        self.rx_export_btn.setEnabled(False)
         self.rx_status.setText("Generando prescripción…")
+        self.rx_job += 1
+        job_id = self.rx_job
 
         def job(_):
-            boundary = self.lot_boundary(det)
-            return polys, boundary, build_prescription(polys, boundary, **args)
+            base = self.lot_boundary(det)
+            # unir los polígonos tarda minutos y no depende del monitor: se reutiliza al cambiarlo
+            with self.rx_base_lock:
+                cached = self.rx_base
+                if cached is None or cached[0] is not polys or cached[1] != args:
+                    cached = self.rx_base = (polys, args, build_prescription(polys, base, **args))
+            rx, boundary = adapt_to_monitor(cached[2], base, key, args["unit"], min_patch, grid_m)
+            return polys, boundary, rx
 
         def done(res):
             self.rx_btn.setEnabled(True)
             p, boundary, rx = res
-            if p is not self.polys:  # cambiaron los polígonos mientras se calculaba
+            if job_id != self.rx_job or p is not self.polys:  # se pidió otra o cambiaron los polígonos mientras se calculaba
                 return
             self.rx, self.rx_boundary = rx, boundary
             self.rx_btn.setText("Generar prescripción")
             s, u = summary(rx, boundary.area), args["unit"]
             self.rx_table.item(0, 2).setText(f"{s['maleza_ha']:.2f}")
-            self.rx_table.item(1, 2).setText(f"{s['fondo_ha']:.2f}" if args["background"] else "—")
+            self.rx_table.item(1, 2).setText(f"{s['fondo_ha']:.2f}" if s["fondo_ha"] else "—")
             prod_u = u.split("/")[0]
-            self.rx_status.setText(f"Producto total: {s['maleza_producto'] + s['fondo_producto']:,.1f} {prod_u}")
+            status = f"Producto total: {s['maleza_producto'] + s['fondo_producto']:,.1f} {prod_u}"
+            if PROFILES[key].format == "shp":
+                status += f" · {n_polygons(rx)} polígonos"
+            limit = over_limit(rx, key)
+            if limit:
+                status += f"\nSupera el máximo de {limit} del monitor: subí el buffer o el ancho de sección."
+            self.rx_status.setText(status)
             self.rx_export_btn.setEnabled(len(rx) > 0)
             self.show_metrics()
             self.render_map()
@@ -990,25 +1143,45 @@ class MainWindow(QMainWindow):
         self.run(job, done, on_fail=lambda: (self.rx_btn.setEnabled(True), self.rx_status.setText("")))
 
     def export_prescription(self):
-        formats = [k for k, c in self.rx_formats.items() if c.isChecked()]
-        if not formats:
-            QMessageBox.information(self, "Exportar prescripción", "Marcá al menos un formato.")
+        key = self.rx_monitor.currentData()
+        monitor = PROFILES[key]
+        limit = over_limit(self.rx, key)
+        if limit and QMessageBox.question(
+                self, "Exportar prescripción",
+                f"La prescripción tiene {n_polygons(self.rx)} polígonos y {monitor.label} admite {limit}. "
+                "Conviene subir el buffer o el ancho de sección. ¿Exportar igual?") != QMessageBox.Yes:
             return
-        name = safe_name(self.perim["gdf"]["nombre"].iloc[0] if self.perim else self.base_ortho())
-        out_dir = os.path.join(self.cfg["paths"]["outputs_dir"], Path(self.base_ortho()).stem, "prescripcion")
+        stem = Path(self.base_ortho()).stem
+        name = safe_name(self.perim["gdf"]["nombre"].iloc[0] if self.perim else stem)
+        out_dir = os.path.join(self.cfg["paths"]["outputs_dir"], stem, "prescripcion")
         os.makedirs(out_dir, exist_ok=True)
-        out_dir = QFileDialog.getExistingDirectory(self, "Carpeta donde guardar la prescripción", out_dir)
-        if not out_dir:
+        # el aviso de reemplazo lo da la app: lo que se escribe es <nombre>_<monitor>, no lo que figura en el cuadro
+        chosen, _ = QFileDialog.getSaveFileName(self, "Nombre y carpeta de la prescripción", os.path.join(out_dir, name),
+                                                "Prescripción (*.zip)", options=QFileDialog.DontConfirmOverwrite)
+        if not chosen:
             return
-        cell = self.cfg.get("prescripcion", {}).get("celda_m", 1.0)
+        out_dir, typed = os.path.split(os.path.normpath(chosen))
+        if typed.lower().endswith(".zip"):
+            typed = typed[:-4]
+        name = safe_name(typed.removesuffix(f"_{key}"))  # sin sufijo: se puede elegir un .zip ya exportado
+        target = os.path.join(out_dir, f"{name}_{key}")
+        if (os.path.exists(target) or os.path.exists(target + ".zip")) and QMessageBox.question(
+                self, "Exportar prescripción", f"Ya existe {name}_{key}. ¿Reemplazarlo?") != QMessageBox.Yes:
+            return
+        cell =self.cfg.get("prescripcion", {}).get("celda_m", 1.0)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            paths = export_prescription(self.rx, self.rx_boundary, out_dir, name, formats, cell,
-                                        self.rx_unit.currentText())
+            root, zip_path = export_for_monitor(self.rx, self.rx_boundary, out_dir, name, key, cell,
+                                                self.rx_unit.currentText())
         finally:
             QApplication.restoreOverrideCursor()
-        lines = "\n".join(f"• {FORMATS[k].split(' (')[0]}: {os.path.relpath(p, out_dir)}" for k, p in paths.items())
-        box = QMessageBox(QMessageBox.Information, "Exportar prescripción", f"Guardado en {out_dir}:\n\n{lines}",
+        files = sorted(os.path.relpath(os.path.join(d, f), root) for d, _, fs in os.walk(root) for f in fs)
+        shown = "\n".join(f"• {f}" for f in files[:8]) + ("\n• …" if len(files) > 8 else "")
+        box = QMessageBox(QMessageBox.Information, "Exportar prescripción",
+                          f"{monitor.label}\n\nCopiá a la raíz del pendrive el contenido de:\n{root}\n\n{shown}\n\n"
+                          f"Lo mismo en .zip: {os.path.basename(zip_path)}\n\n"
+                          + (monitor.note + "\n\n" if monitor.note else "")
+                          + "Este perfil todavía no se probó en un monitor real: probá con agua y un archivo chico.",
                           parent=self)
         open_btn = box.addButton("Abrir carpeta", QMessageBox.ActionRole)
         box.addButton(QMessageBox.Ok)
@@ -1031,11 +1204,10 @@ class MainWindow(QMainWindow):
             except ValueError:
                 view = None
             lots = None
-            if self.lots:  # toda la capa, con su nombre y resaltado el lote elegido
+            if self.lots:  # toda la capa, con su nombre y resaltado el lote elegido (recortado o no)
                 lots = self.lots["gdf"].assign(elegido=[i == self.selected_lot() for i in range(len(self.lots["gdf"]))])
             m = build_map(url, bounds, boxes=self.final, polys=self.polys, view=view,
-                          boxes_visible=self.c_boxes.isChecked(), tiles=self.tiles.register(path),
-                          perimeter=self.perim["gdf"] if self.perim and not self.lots else None, rx=self.rx, lots=lots)
+                          boxes_visible=self.c_boxes.isChecked(), tiles=self.tiles.register(path), rx=self.rx, lots=lots)
             self.map_name = m.get_name()
             self.map_n += 1
             # se alterna el nombre del archivo para que el visor lo cargue de nuevo
@@ -1049,28 +1221,6 @@ class MainWindow(QMainWindow):
             self.view.page().runJavaScript(js, 0, draw)
         else:
             draw(None)
-
-    # ---------- exportar ----------
-
-    def export_results(self):
-        out_dir = os.path.join(self.cfg["paths"]["outputs_dir"], Path(self.det["ortho"]).stem)
-        os.makedirs(out_dir, exist_ok=True)
-        out_dir = QFileDialog.getExistingDirectory(self, "Carpeta donde guardar los resultados", out_dir)
-        if not out_dir:
-            return
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            export(self.final.drop(columns=["px_x1", "px_y1", "px_x2", "px_y2", "truncated"], errors="ignore"),
-                   self.polys, out_dir)
-        finally:
-            QApplication.restoreOverrideCursor()
-        box = QMessageBox(QMessageBox.Information, "Exportar", f"Polígonos y cajas del modelo guardados en:\n{out_dir}",
-                          parent=self)
-        open_btn = box.addButton("Abrir carpeta", QMessageBox.ActionRole)
-        box.addButton(QMessageBox.Ok)
-        box.exec()
-        if box.clickedButton() is open_btn:
-            os.startfile(out_dir)
 
     def closeEvent(self, event):
         self.tiles.close()

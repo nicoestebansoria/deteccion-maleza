@@ -1,23 +1,25 @@
-"""Mapa de prescripción a partir de los polígonos de maleza y export a formatos de pulverizadoras y drones (sin UI).
+"""Mapa de prescripción a partir de los polígonos de maleza y export por monitor de pulverizadora o dron (sin UI).
 
 Zonas: "maleza" (polígonos con buffer +pos, disueltos y buffer -neg) y, opcional, "fondo" (el resto del lote).
-Formatos de export:
-- Shapefile (WGS84, campo rx): John Deere (Operations Center / Gen4 por USB), Trimble, Raven, Ag Leader y la
-  mayoría de los monitores. También se entrega en .zip, que es lo que piden las plataformas web.
-- ISOXML (ISO 11783-10, TASKDATA/TASKDATA.XML + grilla tipo 1): terminales ISOBUS (Case IH, New Holland, AGCO,
-  CLAAS, Amazone, Hardi, Topcon, Müller, CCI...).
-- DJI Agras: carpeta DJI/ con el límite en shapefile y el mapa de dosis en GeoTIFF (como lo exporta Pix4Dfields).
+La geometría base es una sola; cada monitor (PROFILES) define formato, carpeta del pendrive, máximo de polígonos,
+si admite huecos y si se carga como límite. El fondo va solo si se pide. Referencia y fuentes: docs/prescripciones_monitores.md.
+Ningún perfil se probó todavía en un monitor real.
 """
+import math
 import os
+import struct
+import unicodedata
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
 import rasterio
-from rasterio.features import rasterize
+from rasterio.features import rasterize, shapes
 from rasterio.transform import from_origin
+from shapely import make_valid, set_precision
+from shapely.geometry import box, shape
 from shapely.ops import unary_union
 
 # unidad -> (DDI ISOBUS de dosis por área, factor de la unidad a la del DDI)
@@ -25,6 +27,9 @@ from shapely.ops import unary_union
 # 1 kg/ha = 100).
 UNITS = {"L/ha": (1, 100.0), "kg/ha": (6, 100.0)}
 COLS = ["zona", "rx", "unidad", "ha", "geometry"]
+RATE_FIELD = "RATE"  # único campo del shapefile; se usó a mano en el caso de IntelliView IV (ver el doc)
+SIMPLIFY_M = 0.2  # en lote26 cambió el área menos de 1%
+MIN_PIECE_M2 = 0.01  # astillas que dejan la diferencia y los cortes
 
 
 def _polygonal(g):
@@ -68,6 +73,173 @@ def summary(rx, boundary_area_m2):
     return out
 
 
+# ---------- perfiles por monitor (docs/prescripciones_monitores.md) ----------
+
+@dataclass(frozen=True)
+class Monitor:
+    label: str
+    format: str | None  # shp, isoxml, dji; None = la app no puede generar su archivo
+    folder: str = ""  # carpeta del shapefile desde la raíz del pendrive; "" = raíz
+    max_polys: int | None = None
+    holes: bool = True  # False: se parten los anillos de la zona de maleza
+    as_boundary: bool = False  # True: archivo para cargar como límite (solo la maleza, un registro; ver export_shapefile)
+    note: str = ""
+
+
+_PIQ = ("En el monitor (PiQ ≥ 14.60): ajuste que crea zonas de exclusión desde las zonas a 0, o «Turn Off All Sections "
+        "on Zero Target Rate» (corta todo el botalón); para eso marcar «Agregar fondo» con dosis 0. Activar «Enable "
+        "Prescription Usage Automatically». Requiere licencia de prescripciones.")
+_AGCO = "El monitor espera un solo TASKDATA con todos los lotes; la app genera uno por lote."
+_NO_FOLDER = "Carpeta sin verificar: se exporta en la raíz; revisar la guía del fabricante."
+_NO_DOCS = "Formato y carpeta sin documentación pública."
+
+PROFILES = {
+    "ag_leader": Monitor("Ag Leader InCommand 800/1200, Integra", "shp",
+                         note="Reporte sin verificar: no corta secciones en manchones menores al ancho del botalón."),
+    "agco": Monitor("AGCO C2000/C3000, Massey DataTronic 5, Valtra SmartTouch", "isoxml", note=_AGCO),
+    "arag": Monitor("ARAG Bravo 400S / Delta 80", "shp", "maps"),
+    "case_pro1200": Monitor("Case IH Pro 1200 / NH IntelliView 12", "shp"),
+    "case_pro700": Monitor("Case IH Pro 700 / NH IntelliView III-IV", "shp", "Shapefile", max_polys=1000,
+                           as_boundary=True,
+                           note="Cargar como límite: copia el formato de un archivo de Avansys que funcionó así en una "
+                                "IntelliView IV. Solo lleva la zona de maleza (sin fondo) y rx = 0; la dosis no va en "
+                                "el archivo."),
+    "cuffia_ag9500": Monitor("Abelardo Cuffia AG9500", "shp", max_polys=50, note=_NO_FOLDER),
+    "cuffia_fusion": Monitor("Abelardo Cuffia AG Fusion", "shp", max_polys=100, note=_NO_FOLDER),
+    "cuffia_fusionpro": Monitor("Abelardo Cuffia AG Fusion Pro", "shp", max_polys=100,
+                                note=_NO_FOLDER + " Máximo de polígonos sin verificar: se usa el de AG Fusion."),
+    "deere_gen4": Monitor("John Deere GS 2630 / Gen 4 (4640, 4600) / G5", "shp", "Rx",
+                          note="Con Section Control, la dosis 0 apaga secciones (documentado por Deere). "
+                               "En Rx/ pueden ir todos los lotes juntos."),
+    "deere_2600": Monitor("John Deere GS 2600", "shp"),
+    "hexagon": Monitor("Hexagon Ti5/Ti7/Ti10", "shp"),
+    "jacto": Monitor("Jacto Omni 700", "shp"),
+    "microelec": Monitor("Microelec (fertilización/pulverización)", "shp", note=_NO_FOLDER),
+    "muller": Monitor("Müller Touch 800/1200", "shp", "SHP", note="Requiere activar la licencia."),
+    "plantium": Monitor("Plantium SBOX 7/11", "shp", note=f"Al cargarlo, elegir la columna de dosis {RATE_FIELD}."),
+    "raven_viper": Monitor("Raven Viper 4/4+ / Viper Pro", "shp", "Raven/Misc/rxMaps",
+                           note="Viper Pro: las zonas a 0 no cortan solas, hay que configurarlas como «no-spray zones»."),
+    "raven_envizio": Monitor("Raven Envizio Pro", "shp", note=_NO_FOLDER),
+    "stara": Monitor("Stara Topper 4500/5500/6500", "shp", "Dados/Mapas",
+                     note="También se carga por Telemetría Stara."),
+    "teejet": Monitor("TeeJet Matrix Pro GS / Aeros", "isoxml",
+                      note="Importar TASKDATA en Fieldware Link (en la PC) y exportar el trabajo a la consola."),
+    "topcon": Monitor("Topcon X25/X30/X35", "shp", "VRC"),
+    "trimble_piq": Monitor("Trimble GFX-350/750/1060/1260, TMX-2050 (Precision IQ)", "shp", "AgData/Prescriptions",
+                           holes=False, note=_PIQ),
+    "trimble_fmx": Monitor("Trimble FmX / CFX-750", "shp", "AgGPS/Prescriptions", holes=False,
+                           note="CFX-750 necesita el desbloqueo de dosis variable. FmX con factor de escala 1."),
+    "dji_agras": Monitor("DJI Agras (dron)", "dji",
+                         note="En el control: Prescription Map > Map Source «Other», Source unit «ha»."),
+    "shp_generico": Monitor("Otro monitor: Shapefile genérico", "shp",
+                            note="Sin carpeta ni ajustes de un monitor en particular."),
+    "isoxml_generico": Monitor("Otro monitor: ISOXML genérico (TASKDATA)", "isoxml"),
+    # sin archivo propio: figuran deshabilitados para que se vea por qué no se pueden elegir
+    "controlagro": Monitor("ControlAgro CAS 4500 (requiere conversor)", None,
+                           note="Pide .SFV convertido con el software MHS."),
+    "tim": Monitor("TIM CS Oro Máx / TS Oro (requiere conversor)", None, note="Pide .srm convertido con proMAP."),
+    "verion": Monitor("Verion Vcom 7/10 (requiere conversor)", None, note="Pide un archivo convertido con Agromapas 4.0."),
+    "case_pro600": Monitor("Case IH Pro 600 (solo .cn1)", None, note="Solo lee el formato .cn1."),
+    "caiman": Monitor("Caimán (sin verificar)", None, note=_NO_DOCS),
+    "metalfor": Monitor("Metalfor (sin verificar)", None, note=_NO_DOCS),
+    "sensor": Monitor("Sensor (sin verificar)", None, note=_NO_DOCS),
+}
+DEFAULT_MONITOR = "shp_generico"
+
+
+def min_patch_m2(section_m, speed_kmh, delay_s):
+    """Superficie mínima de un manchón: ancho de sección x distancia recorrida durante el retardo de las válvulas."""
+    return section_m * speed_kmh / 3.6 * delay_s
+
+
+def _parts(g):
+    return [p for p in getattr(g, "geoms", [g]) if not p.is_empty]
+
+
+def _grow_small_patches(weed, min_m2):
+    """Agranda los manchones chicos hasta ~min_m2 en vez de descartarlos: no se pierde maleza. Los que se tocan se unen."""
+    return unary_union([p if p.area >= min_m2 else p.buffer(math.sqrt(min_m2 / math.pi) - math.sqrt(p.area / math.pi))
+                        for p in _parts(weed)])
+
+
+def _to_grid(weed, boundary, cell_m):
+    """Maleza en bloques cuadrados de cell_m, alineados al norte y al CRS: toda celda que toca maleza se aplica entera."""
+    minx, miny, maxx, maxy = boundary.bounds
+    transform = from_origin(minx, maxy, cell_m, cell_m)
+    size = (math.ceil((maxy - miny) / cell_m), math.ceil((maxx - minx) / cell_m))
+    cells = rasterize(_parts(weed), out_shape=size, transform=transform, all_touched=True, dtype="uint8")
+    return unary_union([make_valid(shape(g)) for g, _ in shapes(cells, mask=cells > 0, transform=transform)])
+
+
+def _split_holes(poly):
+    """Polígonos sin huecos que cubren lo mismo: corta en vertical por el hueco de la mediana, hasta que no queden."""
+    if not poly.interiors:
+        return [poly]
+    x = sorted(r.centroid.x for r in poly.interiors)[len(poly.interiors) // 2]
+    minx, miny, maxx, maxy = poly.bounds
+    out = []
+    for half in (box(minx - 1, miny - 1, x, maxy + 1), box(x, miny - 1, maxx + 1, maxy + 1)):
+        for part in _parts(_polygonal(poly.intersection(half))):
+            out.extend(_split_holes(part))
+    return out
+
+
+def adapt_to_monitor(rx, boundary, key, unit, min_patch=0.0, grid_m=0.0):
+    """Zonas y límite como los necesita el monitor. Devuelve (rx, boundary) en el mismo CRS métrico.
+    grid_m > 0: la maleza se pasa a bloques cuadrados de ese lado, después de agrandar los manchones chicos.
+
+    Shapefile: simplificado y una fila por polígono simple; maleza sin anillos si el perfil lo pide. El fondo va solo si
+    se pidió y se recalcula como lote - maleza, así las zonas no se pisan ni dejan rendijas después de agrandar y
+    simplificar. Perfil de límite (as_boundary): solo la maleza, en una fila multiparte."""
+    monitor = PROFILES[key]
+    is_shp = monitor.format == "shp"
+    weed_rows, bg_rows = rx[rx["zona"] == "maleza"], rx[rx["zona"] == "fondo"]
+    weed = unary_union(list(weed_rows.geometry)) if len(weed_rows) else None
+    if is_shp:
+        boundary = _polygonal(make_valid(boundary.simplify(SIMPLIFY_M)))
+    if weed is not None:
+        if min_patch > 0:
+            weed = _grow_small_patches(weed, min_patch)
+        if grid_m > 0:
+            weed = _to_grid(weed, boundary, grid_m)
+        if is_shp:
+            weed = make_valid(weed.simplify(SIMPLIFY_M))
+        weed = _polygonal(weed.intersection(boundary))
+    zones = []
+    if weed is not None and not weed.is_empty:
+        zones.append(("maleza", float(weed_rows["rx"].iloc[0]), weed))
+    if len(bg_rows) and not monitor.as_boundary:
+        bg = _polygonal(boundary.difference(weed)) if weed is not None else boundary
+        if not bg.is_empty:
+            zones.append(("fondo", float(bg_rows["rx"].iloc[0]), bg))
+    rows = []
+    for zona, rate, geom in zones:
+        pieces = [geom]
+        if is_shp:
+            pieces = _parts(geom)
+            if not monitor.holes and zona == "maleza":  # el fondo rodea la maleza: partirlo solo sumaría polígonos
+                pieces = [q for p in pieces for q in _split_holes(p)]
+            pieces = [p for p in pieces if p.area >= MIN_PIECE_M2]
+            if monitor.as_boundary and pieces:
+                pieces = [unary_union(pieces)]
+        rows.extend({"zona": zona, "rx": rate, "geometry": p} for p in pieces)
+    out = gpd.GeoDataFrame(rows, columns=["zona", "rx", "geometry"], geometry="geometry", crs=rx.crs)
+    out["unidad"] = unit
+    out["ha"] = out.geometry.area / 1e4
+    return out[COLS], boundary
+
+
+def n_polygons(rx):
+    """Polígonos simples: en los perfiles de límite una fila tiene muchas partes."""
+    return sum(len(_parts(g)) for g in rx.geometry)
+
+
+def over_limit(rx, key):
+    """Máximo de polígonos del monitor si esta prescripción lo supera; si no, None."""
+    limit = PROFILES[key].max_polys
+    return limit if limit is not None and n_polygons(rx) > limit else None
+
+
 # ---------- grilla común a ISOXML y GeoTIFF ----------
 
 def rate_grid(rx, boundary, cell_m):
@@ -91,21 +263,64 @@ def rate_grid(rx, boundary, cell_m):
 
 # ---------- exports ----------
 
-def _zip(paths, zip_path):
+def _zip_tree(root, zip_path):
+    """Zip cuyo contenido es lo que hay dentro de root: se descomprime directo en la raíz del pendrive."""
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for p in paths:
-            z.write(p, os.path.basename(p))
+        for folder, _, files in os.walk(root):
+            for f in files:
+                full = os.path.join(folder, f)
+                z.write(full, os.path.relpath(full, root))
 
 
-def export_shapefile(rx, out_dir, name):
-    """Una fila por zona (multipolígono: maleza y, si hay, fondo) en WGS84 con rx (dosis), unidad, zona y ha.
-    Nombres de campo <= 10 caracteres (DBF)."""
+def _write_dbf(path, field, width, decimals, values):
+    """DBF con un solo campo numérico; values ya formateados (texto de hasta width caracteres). pyogrio no deja elegir
+    el ancho y escribe N 24.15."""
+    today = datetime.now()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<BBBBIHH20x", 3, today.year - 1900, today.month, today.day, len(values), 65, width + 1))
+        f.write(struct.pack("<11scxxxxBB14x", field.encode("ascii"), b"N", width, decimals) + b"\r")
+        for v in values:
+            f.write(b" " + v.rjust(width).encode("ascii"))
+        f.write(b"\x1a")
+
+
+# .prj de WGS84 en WKT de ESRI, el que traen los shapefiles de Avansys que lee la IntelliView IV
+WGS84_PRJ = ('GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],'
+             'PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]')
+
+
+def _valid_wgs84(rx):
+    """Pasa a WGS84 con polígonos simples y válidos. Un hueco que toca un borde es válido en metros, pero al reproyectar
+    puede cruzarlo por una fracción de milímetro; redondear a 1e-8° (~1 mm) lo resuelve."""
+    gdf = rx.to_crs("EPSG:4326")
+    gdf = gdf.set_geometry(set_precision(make_valid(np.asarray(gdf.geometry.values)), 1e-8)).explode(index_parts=False)
+    return gdf[(gdf.geom_type == "Polygon") & ~gdf.is_empty]
+
+
+def export_shapefile(rx, out_dir, name, as_boundary=False):
+    """Una fila por polígono en WGS84 (con .prj), con el campo de dosis como único atributo.
+
+    as_boundary: copia del shapefile de Avansys que funciona cargado como límite en una IntelliView IV (ver el doc):
+    toda la maleza en un solo registro multiparte (con huecos), campo rx N 5.4 con valor 0 y .cpg ISO-8859-1."""
     os.makedirs(out_dir, exist_ok=True)
-    gdf = rx.to_crs("EPSG:4326")  # build_prescription ya deja una fila por zona y el área en ha
+    gdf = _valid_wgs84(rx)
+    if as_boundary:
+        gdf = gpd.GeoDataFrame({"rx": [0.0]}, geometry=[unary_union(gdf.geometry.values)], crs=gdf.crs)
     shp = os.path.join(out_dir, f"{name}.shp")
-    gdf.to_file(shp, driver="ESRI Shapefile")
-    parts = [os.path.join(out_dir, f"{name}{ext}") for ext in (".shp", ".shx", ".dbf", ".prj", ".cpg")]
-    _zip([p for p in parts if os.path.exists(p)], os.path.join(out_dir, f"{name}.zip"))
+    gdf[["rx", "geometry"]].rename(columns={"rx": RATE_FIELD}).to_file(shp, driver="ESRI Shapefile")
+    dbf = os.path.join(out_dir, f"{name}.dbf")
+    if as_boundary:
+        _write_dbf(dbf, "rx", 5, 4, ["0.000"])  # mismos bytes que el archivo de Avansys
+    else:
+        _write_dbf(dbf, RATE_FIELD, 10, 2, [f"{r:.2f}" for r in gdf["rx"]])
+    with open(os.path.join(out_dir, f"{name}.prj"), "w", encoding="ascii") as f:
+        f.write(WGS84_PRJ)
+    cpg = os.path.join(out_dir, f"{name}.cpg")  # sin campos de texto no hace falta, salvo para copiar a Avansys
+    if as_boundary:
+        with open(cpg, "w", encoding="ascii") as f:
+            f.write("ISO-8859-1")
+    elif os.path.exists(cpg):
+        os.remove(cpg)
     return shp
 
 
@@ -179,26 +394,27 @@ def export_isoxml(rx, boundary, out_dir, name, cell_m, unit="L/ha", product="Her
     return task_dir
 
 
-FORMATS = {
-    "shp": "Shapefile (John Deere, Trimble, Raven, Ag Leader y monitores en general)",
-    "isoxml": "ISOXML (terminales ISOBUS: Case, New Holland, AGCO, CLAAS, Amazone…)",
-    "dji": "DJI Agras (límite SHP + mapa de dosis TIFF)",
-}
-
-
-def export_prescription(rx, boundary, out_dir, name, formats, cell_m, unit="L/ha"):
-    """Exporta en los formatos pedidos; devuelve {formato: ruta}."""
-    out = {}
-    if "shp" in formats:
-        out["shp"] = export_shapefile(rx, os.path.join(out_dir, "shapefile"), name)
-    if "isoxml" in formats:
-        out["isoxml"] = export_isoxml(rx, boundary, out_dir, name, cell_m, unit)
-    if "dji" in formats:
-        out["dji"] = export_dji(rx, boundary, out_dir, name, cell_m)
-    return out
+def export_for_monitor(rx, boundary, out_dir, name, key, cell_m, unit="L/ha"):
+    """Arma <out_dir>/<name>_<monitor>/ con la estructura del pendrive y el mismo contenido en un .zip al lado.
+    rx ya tiene que venir de adapt_to_monitor. Devuelve (carpeta, zip)."""
+    monitor = PROFILES[key]
+    root = os.path.join(out_dir, f"{name}_{key}")
+    if monitor.format == "shp":
+        shp_name = f"{datetime.now():%Y%m%d}-{name}" if monitor.as_boundary else name  # como Avansys: 20261108-LOTE_28
+        export_shapefile(rx, os.path.join(root, *monitor.folder.split("/")), shp_name, monitor.as_boundary)
+    elif monitor.format == "isoxml":
+        export_isoxml(rx, boundary, root, name, cell_m, unit)
+    elif monitor.format == "dji":
+        export_dji(rx, boundary, root, name, cell_m)
+    else:
+        raise ValueError(f"La app no genera archivos para {monitor.label}.")
+    zip_path = root + ".zip"
+    _zip_tree(root, zip_path)
+    return root, zip_path
 
 
 def safe_name(text):
     """Nombre de archivo corto y sin caracteres raros (algunos monitores no leen acentos ni espacios)."""
-    keep = "".join(c if c.isalnum() or c in "-_" else "_" for c in Path(text).stem)
-    return keep.encode("ascii", "ignore").decode()[:40] or "prescripcion"
+    plain = unicodedata.normalize("NFKD", text.strip()).encode("ascii", "ignore").decode()  # Ñandú -> Nandu
+    keep = "".join(c if c.isalnum() or c in "-_" else "_" for c in plain)
+    return keep[:40] or "prescripcion"

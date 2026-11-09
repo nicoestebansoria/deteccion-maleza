@@ -81,6 +81,19 @@ def lot_perimeter(path, lots, i):
     return gpd.GeoDataFrame({"nombre": [nombre], "recorte": [recorte]}, geometry=[lot.geometry], crs=lots.crs)
 
 
+def best_lot(lots, footprint, crs):
+    """Lote al que corresponde el orto: (posición, parte del lote con datos), o None si ninguno lo toca.
+    Puntaje = área cubierta x parte del lote cubierta: gana un lote entero frente a un vecino más grande cubierto a
+    medias, y frente a un lote chico entero cuando el orto cubre también otro más grande."""
+    geoms = lots.geometry.to_crs(crs).buffer(0)
+    covered = geoms.intersection(footprint).area.to_numpy()
+    if not covered.any():
+        return None
+    share = covered / geoms.area.to_numpy()
+    i = int(np.argmax(covered * share))
+    return i, float(share[i])
+
+
 def perimeter_in(perim, crs):
     """Geometría del perímetro en el CRS del orto."""
     return perim.to_crs(crs).geometry.iloc[0]
